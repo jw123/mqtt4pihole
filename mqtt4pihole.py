@@ -1,7 +1,7 @@
 """mqtt4pihole creates an interface between Pi-hole and MQTT,
 allowing certain elements to be exposed to Home Assistant as switches
 """
-__version__ = '0.1'
+__version__ = '0.2.0'
 
 import json
 import os
@@ -403,7 +403,6 @@ class gravity_records(dict):
         self.exiting = False
         signal.signal(signal.SIGINT, self.exit_intended)
         signal.signal(signal.SIGTERM, self.exit_intended)
-        # signal.signal(signal.SIGHUP, self.exit_intended) # SIGHUP?
 
     def pop(self, key):
         logger.debug(f'Removing record {key}')
@@ -420,11 +419,11 @@ class gravity_records(dict):
             logger.debug('Starting check_mqtt loop')
             while not self.exiting:
                 logger.debug('Waiting for messages...')
-                msg = await self.connection.create_message_future()
-                # msg normally is a mqtt message object, but if
-                # 'exit_intended()' is invoked, a string ('Exit')
-                # is returned.
-                if type(msg) is not str:
+                try:
+                    msg = await self.connection.create_message_future()
+                except asyncio.CancelledError:
+                    logger.debug('Aborted waiting for MQTT message')
+                else:
                     topic_list = msg.topic.split('/')
                     enabledVal = {'off': 0, 'on': 1}.get(
                         msg.payload.decode().lower(), -1
@@ -440,9 +439,10 @@ class gravity_records(dict):
                         except KeyError as ke:
                             logger.error('Invalid message '
                                          f'recieved for "{ke}"')
-                self.connection.got_message = None
             else:
+                logger.debug('Finished check_mqtt loop')
                 return 0
+            logger.error('Error in check_mqtt loop')
             return 0b0001000
 
         async def check_gravity(
@@ -554,7 +554,9 @@ class gravity_records(dict):
                         float(config['pihole_check_frequency'])
                     )
             else:
+                logger.debug('Finished check_gravity loop')
                 return 0
+            logger.error('Error in check_gravity loop')
             return 0b0010000
 
         async def update_pihole() -> int:
@@ -597,7 +599,9 @@ class gravity_records(dict):
                         logger.error('Failed to reload Pi-hole lists',
                                      exc_info=1)
             else:
+                logger.debug('Finished update_pihole loop')
                 return 0
+            logger.error('Error in update_pihole loop')
             return 0b0100000
 
         async def check_pihole() -> int:
@@ -614,7 +618,9 @@ class gravity_records(dict):
                 await asyncio.sleep(
                     float(config['pihole_check_frequency']))
             else:
+                logger.debug('Finished check_pihole loop')
                 return 0
+            logger.error('Error in check_pihole loop')
             return 0b1000000
 
         # Run tasks in continuous loop
@@ -630,11 +636,9 @@ class gravity_records(dict):
             logger.info(f'Signal {signal.strsignal(args[0]).upper()} '
                         'received... exiting...')
         self.availability(False)
-        self.connection.disconnect_intended = True
-        self.connection.client.disconnect()
-        if self.connection.got_message is not None:
-            self.connection.got_message.set_result('Exit')
         self.exiting = True
+        self.connection.persistent = False
+        self.connection.cancel_message_future()
 
     @log_decorator
     def FTL_pid(self) -> int:
@@ -695,9 +699,8 @@ def run() -> int:
         # Set event loop policy
         asyncio.set_event_loop_policy(EL_policy())
         # Create and enter asyncio loop
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        with asyncio.Runner() as runner:
+            loop = runner.get_loop()
 
             # Set rc for the event that there is a problem setting up
             # the MQTT connection.
@@ -716,19 +719,14 @@ def run() -> int:
                     sleep_time=float(config['mqtt_check_frequency']),
                     subscribe_topic=f'{config["mqtt_topic"]}/+/set'
                     ) as m_con:
-                grav_recs = gravity_records(
-                    mqtt_connection=m_con,
-                    db_connection=db_con
-                )
-                rc = loop.run_until_complete(grav_recs.main())
+                if m_con:
+                    grav_recs = gravity_records(
+                        mqtt_connection=m_con,
+                        db_connection=db_con
+                    )
+                    rc = runner.run(grav_recs.main())
                 logger.info('Exiting...')
-        except Exception as ex:
-            logger.critical(f'Exception {ex} recieved', exc_info=1)
-        finally:
-            asyncio.set_event_loop(None)
-            loop.stop()
-            loop.close()
-            return rc
+    return rc
 
 
 if __name__ == '__main__':

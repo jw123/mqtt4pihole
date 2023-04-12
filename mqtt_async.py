@@ -19,6 +19,9 @@ import asyncio
 import logging
 import socket
 import paho.mqtt.client as mqtt
+import time
+
+RECONNECT_WAIT = 6
 
 
 class AsyncioHelper:
@@ -67,9 +70,8 @@ class AsyncioHelper:
         Removes the reader and stops calling loop_misc().
         """
         logging.info('Socket closed')
-        if not self.misc.done():
-            self.loop.remove_reader(sock)
-            self.misc.cancel()
+        self.loop.remove_reader(sock)
+        self.misc.cancel()
 
     def on_socket_register_write(self, client, userdata, sock):
         """Callback function for socket write register"""
@@ -110,14 +112,14 @@ class mqtt_connection:
             keepalive: int = 60,
             sock_buff: int = 2048,
             sleep_time: float = 1,
-            subscribe_topic: str = '#'):
+            subscribe_topic: str = '#',
+            persistent: bool = True):
         """A class that presents an MQTT connection as an object.
 
         When initialised, the object stores the intended event loop
         but does not connect.
         """
         self.loop = loop
-        self.disconnect_intended = False
         self.subscribe_topic = subscribe_topic
         self.mqtt_user = user
         self.mqtt_pw = pw
@@ -127,33 +129,42 @@ class mqtt_connection:
         self.mqtt_keepalive = keepalive
         self.mqtt_sock_buff = sock_buff
         self.mqtt_sleep = sleep_time
+        self.persistent = persistent
 
     def __enter__(self):
         """Open a connection"""
         logging.debug('Opening connection')
         self.connect()
+        while self.loop.run_until_complete(
+                self.connect_result) != 0:
+            if not self.persistent:
+                raise ConnectionError
         return self
 
     def __exit__(self, *args):
         """Close the connection"""
         logging.debug('MQTT Connection object disconnecting')
-        self.disconnect_intended = True
+        self.persistent = False
         self.client.disconnect()
-        if not self.aioh.misc.done():
-            self.loop.remove_reader(self.client.socket())
-            self.aioh.misc.cancel()
+        if not self.disconnected.done():
+            self.loop.run_until_complete(self.disconnected)
 
     def on_connect(self, client, userdata, flags, rc):
         """Callback function for when a MQTT connection is made.
 
         Subscribes to a MQTT topic.
         """
-        logging.info('Connected with result code '+str(rc))
-        logging.info('Subscribing...')
-        try:
-            client.subscribe(self.subscribe_topic)
-        except Exception:
-            logging.critical('MQTT client failed to subscribe')
+        if rc == 0:
+            logging.info('Connected with result code '+str(rc))
+            logging.info('Subscribing...')
+            try:
+                client.subscribe(self.subscribe_topic)
+            except Exception:
+                logging.critical('MQTT client failed to subscribe')
+                raise ConnectionError
+        else:
+            logging.warning('Failed to connect. Result code '+str(rc))
+        self.connect_result.set_result(rc)
 
     def on_message(self, client, userdata, msg):
         """Callback function for when a MQTT message is received."""
@@ -167,18 +178,25 @@ class mqtt_connection:
 
         Reconnect if this was not intended.
         """
-        if self.disconnect_intended:
-            self.disconnected.set_result(rc)
-        else:
+        self.cancel_message_future()
+        while self.persistent:
             logging.info(f'Unintentional MQTT disconnection (code {rc}).')
+            time.sleep(RECONNECT_WAIT)
             logging.info('Reconnecting...')
-            self.connect()
+            try:
+                self.connect()
+                break
+            except ConnectionError:
+                pass
+        else:
+            self.disconnected.set_result(rc)
 
     def connect(self):
         """Create a new MQTT client object, attach it to the connection
         object, and connect to the broker.
         """
         self.disconnected = self.loop.create_future()
+        self.connect_result = self.loop.create_future()
         self.got_message = None
 
         self.client = mqtt.Client()
@@ -215,3 +233,13 @@ class mqtt_connection:
         """
         self.got_message = self.loop.create_future()
         return self.got_message
+
+    def cancel_message_future(self) -> int:
+        """Cancels the message future, if it exists"""
+        try:
+            self.got_message.cancel()
+            rc = 0
+            logging.debug('Canceled message future')
+        except AttributeError:
+            rc = 1
+        return rc
