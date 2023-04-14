@@ -183,6 +183,11 @@ class mqtt_connection:
             logging.info(f'Unintentional MQTT disconnection (code {rc}).')
             time.sleep(RECONNECT_WAIT)
             logging.info('Reconnecting...')
+            if not self.disconnected.done():
+                self.disconnected.cancel()
+            if not self.connect_result.done():
+                self.connect_result.cancel()
+            del self.client
             try:
                 self.connect()
                 break
@@ -207,7 +212,7 @@ class mqtt_connection:
         self.client.on_message = self.on_message
         self.client.on_disconnect = self.on_disconnect
 
-        self.aioh = AsyncioHelper(
+        aioh = AsyncioHelper(  # noqa: F841
                 self.loop,
                 self.client,
                 self.mqtt_sleep)

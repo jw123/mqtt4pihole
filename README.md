@@ -12,8 +12,8 @@ The script must be run as the pihole user (i.e. pihole), or failing that, as roo
 
 1. Copy the mqtt4pihole.py, mqtt_async.py, and config.yaml files into a local directory.
 2. Edit the config.yaml file.
-3. Create a virtual environment in the local directory using `venv -m .`.
+3. Create a virtual environment in the local directory using `python -m venv .`.
 4. Make sure all files and directories are owned by pihole.
-5. Activate the virtual environment, e.g. `source .bin/activate`
+5. Activate the virtual environment, e.g. `source bin/activate`
 6. Install dependant python packages, e.g. `pip install pyyaml paho-mqtt`
 7. Run the script, ideally as a pihole daemon, but can be tested using root, e.g. `sudo python mqtt4pihole.py`
