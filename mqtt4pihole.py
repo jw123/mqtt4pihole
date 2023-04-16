@@ -1,7 +1,7 @@
 """mqtt4pihole creates an interface between Pi-hole and MQTT,
 allowing certain elements to be exposed to Home Assistant as switches
 """
-__version__ = '0.2.1'
+__version__ = '0.2.2'
 
 import json
 import os
@@ -189,9 +189,10 @@ class gravity_records(dict):
                         f'{self.switch_type} id {self.id}')
             self.__json_announce_msg.update(ne_update)
             logger.debug(f'Payload: {self.__json_announce_msg}')
-            self.publish(topic=ne_topic, payload=json.dumps(
-                self.__json_announce_msg
-            ))
+            self.publish(topic=ne_topic,
+                         retain=True,
+                         payload=json.dumps(self.__json_announce_msg)
+                         )
             self.hass_upd()
             await asyncio.sleep(
                     float(config['mqtt_check_frequency']))
@@ -401,6 +402,7 @@ class gravity_records(dict):
         self.db_con = db_connection
         self.db_cur = self.db_con.cursor()
         self.exiting = False
+        self.pihole_on = False
         signal.signal(signal.SIGINT, self.exit_intended)
         signal.signal(signal.SIGTERM, self.exit_intended)
 
@@ -545,10 +547,10 @@ class gravity_records(dict):
                 # There is no point in checking gravity more than once
                 # if pihole isn't running. Having this loop at the end
                 # ensures entities are added even if pihole isn't running.
-                while self.FTL_pid() == 0 and not self.exiting:
+                while not self.pihole_on and not self.exiting:
                     await asyncio.sleep(
                         float(config['pihole_check_frequency'])
-                        )
+                    )
                 else:
                     await asyncio.sleep(
                         float(config['pihole_check_frequency'])
@@ -610,11 +612,13 @@ class gravity_records(dict):
             """
             logger.debug('Starting check_pihole loop')
             while not self.exiting:
-                pihole_on = bool(self.FTL_pid())
-                if not pihole_on:
+                pihole_on_check = bool(self.FTL_pid())
+                if not pihole_on_check:
                     logger.error('Pi-hole is not running.  '
                                  'No action will be taken')
-                self.availability(pihole_on)
+                if pihole_on_check != self.pihole_on:
+                    self.availability(pihole_on_check)
+                    self.pihole_on = pihole_on_check
                 await asyncio.sleep(
                     float(config['pihole_check_frequency']))
             else:
@@ -652,7 +656,8 @@ class gravity_records(dict):
         logger.debug(f'Setting availability: {av_on}')
         self.connection.client.publish(
             topic=f'{config["mqtt_topic"]}/state',
-            payload='online' if av_on else 'offline')
+            payload='online' if av_on else 'offline',
+            retain=True)
 
 
 @log_decorator
