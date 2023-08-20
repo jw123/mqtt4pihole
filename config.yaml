@@ -1,0 +1,24 @@
+########################
+### Mandatory inputs ###
+########################
+#mqtt_user: USER
+#mqtt_pw: PASSWORD
+#mqtt_host: HOST
+
+##############################################
+#### Optional inputs (with defaults shown) ###
+##############################################
+#mqtt_port: 8883
+#mqtt_ssl: True
+#mqtt_keepalive: 60
+#mqtt_topic: mqtt4pihole
+#mqtt_hass_topic: homeassistant
+#mqtt_sock_buff: 2048
+#db_file: /etc/pihole/gravity.db
+#pihole_update_frequency: 10
+#pihole_check_frequency: 5
+#mqtt_check_frequency: 1
+#ftl_pid_file: /run/pihole-FTL.pid
+#pihole_url: http://pi.hole/admin
+#hass_tag: HASS
+#log_level: info

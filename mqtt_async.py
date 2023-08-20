@@ -19,9 +19,10 @@ import asyncio
 import logging
 import socket
 import paho.mqtt.client as mqtt
-import time
 
-RECONNECT_WAIT = 6
+
+class mqttConnectionError(ConnectionError):
+    ...
 
 
 class AsyncioHelper:
@@ -112,15 +113,16 @@ class mqtt_connection:
             keepalive: int = 60,
             sock_buff: int = 2048,
             sleep_time: float = 1,
-            subscribe_topic: str = '#',
-            persistent: bool = True):
+            subscribe_topics: list = ['#']):
         """A class that presents an MQTT connection as an object.
 
         When initialised, the object stores the intended event loop
         but does not connect.
         """
         self.loop = loop
-        self.subscribe_topic = subscribe_topic
+        self.subscribe_topics = list(
+            zip(subscribe_topics, [0 for x in range(len(subscribe_topics))])
+        )
         self.mqtt_user = user
         self.mqtt_pw = pw
         self.mqtt_host = host
@@ -129,22 +131,19 @@ class mqtt_connection:
         self.mqtt_keepalive = keepalive
         self.mqtt_sock_buff = sock_buff
         self.mqtt_sleep = sleep_time
-        self.persistent = persistent
 
     def __enter__(self):
         """Open a connection"""
         logging.debug('Opening connection')
         self.connect()
-        while self.loop.run_until_complete(
+        if self.loop.run_until_complete(
                 self.connect_result) != 0:
-            if not self.persistent:
-                raise ConnectionError
+            raise mqttConnectionError
         return self
 
     def __exit__(self, *args):
         """Close the connection"""
-        logging.debug('MQTT Connection object disconnecting')
-        self.persistent = False
+        logging.info('MQTT Connection object disconnecting')
         self.client.disconnect()
         if not self.disconnected.done():
             self.loop.run_until_complete(self.disconnected)
@@ -158,10 +157,10 @@ class mqtt_connection:
             logging.info('Connected with result code '+str(rc))
             logging.info('Subscribing...')
             try:
-                client.subscribe(self.subscribe_topic)
+                client.subscribe(self.subscribe_topics)
             except Exception:
-                logging.critical('MQTT client failed to subscribe')
-                raise ConnectionError
+                logging.error('MQTT client failed to subscribe')
+                raise mqttConnectionError
         else:
             logging.warning('Failed to connect. Result code '+str(rc))
         self.connect_result.set_result(rc)
@@ -175,26 +174,9 @@ class mqtt_connection:
 
     def on_disconnect(self, client, userdata, rc):
         """Callback function fow when the MQTT connection ends.
-
-        Reconnect if this was not intended.
         """
         self.cancel_message_future()
-        while self.persistent:
-            logging.info(f'Unintentional MQTT disconnection (code {rc}).')
-            time.sleep(RECONNECT_WAIT)
-            logging.info('Reconnecting...')
-            if not self.disconnected.done():
-                self.disconnected.cancel()
-            if not self.connect_result.done():
-                self.connect_result.cancel()
-            del self.client
-            try:
-                self.connect()
-                break
-            except ConnectionError:
-                pass
-        else:
-            self.disconnected.set_result(rc)
+        self.disconnected.set_result(rc)
 
     def connect(self):
         """Create a new MQTT client object, attach it to the connection
@@ -220,16 +202,25 @@ class mqtt_connection:
         self.__client_connect()
 
     def __client_connect(self):
-        self.client.connect(
-            self.mqtt_host,
-            self.mqtt_port,
-            self.mqtt_keepalive
-            )
-        self.client.socket().setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_SNDBUF,
-            self.mqtt_sock_buff
-            )
+        try:
+            self.client.connect(
+                self.mqtt_host,
+                self.mqtt_port,
+                self.mqtt_keepalive
+                )
+            self.client.socket().setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_SNDBUF,
+                self.mqtt_sock_buff
+                )
+        except (
+                ConnectionError,
+                TimeoutError,
+                socket.herror,
+                socket.gaierror
+        ) as conErr:
+            logging.error(conErr)
+            self.connect_result.set_result(-1)
 
     def create_message_future(self):
         """Creates and returns a future that points to
@@ -247,4 +238,5 @@ class mqtt_connection:
             logging.debug('Canceled message future')
         except AttributeError:
             rc = 1
+            logging.debug('Failed to cancel message future; no future exists.')
         return rc

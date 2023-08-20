@@ -1,7 +1,7 @@
 """mqtt4pihole creates an interface between Pi-hole and MQTT,
 allowing certain elements to be exposed to Home Assistant as switches
 """
-__version__ = '0.2.2'
+__version__ = '0.3.0'
 
 import json
 import os
@@ -13,9 +13,7 @@ import logging
 import selectors
 import yaml
 import mqtt_async as mqtt
-
-# Friendlier handle for version, as global
-MQTT4PIHOLE_VERSION = __version__
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +171,7 @@ class gravity_records(dict):
                 'ids': [f'{config["mqtt_topic"]}_control_switches'],
                 'mf': 'jw123',
                 'mdl': 'mqtt4pihole',
-                'sw': MQTT4PIHOLE_VERSION,
+                'sw': __version__,
                 'name': f'{config["mqtt_topic"]} control switches'
             }
             ne_update = {
@@ -403,6 +401,7 @@ class gravity_records(dict):
         self.db_cur = self.db_con.cursor()
         self.exiting = False
         self.pihole_on = False
+        self.reinitialise = False
         signal.signal(signal.SIGINT, self.exit_intended)
         signal.signal(signal.SIGTERM, self.exit_intended)
 
@@ -426,21 +425,30 @@ class gravity_records(dict):
                 except asyncio.CancelledError:
                     logger.debug('Aborted waiting for MQTT message')
                 else:
-                    topic_list = msg.topic.split('/')
-                    enabledVal = {'off': 0, 'on': 1}.get(
-                        msg.payload.decode().lower(), -1
-                        )
-                    logger.debug(f'Message received for {topic_list[1]}. '
-                                 f'Set to {enabledVal}')
-                    # Set the value as required
-                    if enabledVal >= 0:
-                        try:
-                            self[
-                                str(topic_list[1])
-                                ].mqtt_state = enabledVal
-                        except KeyError as ke:
-                            logger.error('Invalid message '
-                                         f'recieved for "{ke}"')
+                    if f'{config["mqtt_hass_topic"]}/status' in msg.topic:
+                        self.reinitialise = (
+                            msg.payload.decode().lower() == 'online'
+                            )
+                    elif config['mqtt_topic'] in msg.topic:
+                        topic_list = msg.topic.split('/')
+                        enabledVal = {'off': 0, 'on': 1}.get(
+                            msg.payload.decode().lower(), -1
+                            )
+                        logger.debug(f'Message received for {topic_list[1]}. '
+                                     f'Set to {enabledVal}')
+                        # Set the value as required
+                        if enabledVal >= 0:
+                            try:
+                                self[
+                                    str(topic_list[1])
+                                    ].mqtt_state = enabledVal
+                            except KeyError as ke:
+                                logger.warning('Invalid message '
+                                               f'recieved for "{ke}"')
+                # Check that mqtt is still connected, otherwise exit.
+                if self.connection.disconnected.done():
+                    self.exit_intended()
+                    return 0b0000100
             else:
                 logger.debug('Finished check_mqtt loop')
                 return 0
@@ -492,6 +500,10 @@ class gravity_records(dict):
                 del new_g_state
                 logger.debug(new_state)
                 logger.debug(f'Got {len(new_state)} records')
+                # Clear the existing state if we need to reinitialise
+                if self.reinitialise:
+                    existing_state = {tuple(None for x in range(7))}
+                    self.reinitialise = False
                 # First check that the database is the same
                 # as the stored list
                 if existing_state != new_state:
@@ -588,13 +600,15 @@ class gravity_records(dict):
                         f'WHERE id = {gr.id};'
                         ).fetchall()[0][0]
                     gr.enabled = sqlcheck
-                    gr.hass_upd()
                     logger.debug('Check of db confirmed that '
                                  f'state was set to {str(sqlcheck)}')
-
                 # If the gravity db is changed, we need to reload lists
                 # in dnsmasq-FTL with SIGRTMIN
                 if updates and self.FTL_pid() != 0:
+                    # Republish to Hass all records if any updates
+                    # This helps Hass keep state properly
+                    for gr in self.values():
+                        gr.hass_upd()
                     try:
                         os.kill(self.FTL_pid(), signal.SIGRTMIN)
                     except Exception:
@@ -608,14 +622,14 @@ class gravity_records(dict):
 
         async def check_pihole() -> int:
             """Check that pihole is running and note the pid,
-            otherwise log an error message
+            otherwise log a message
             """
             logger.debug('Starting check_pihole loop')
             while not self.exiting:
                 pihole_on_check = bool(self.FTL_pid())
                 if not pihole_on_check:
-                    logger.error('Pi-hole is not running.  '
-                                 'No action will be taken')
+                    logger.warning('Pi-hole is not running.  '
+                                   'No action will be taken')
                 if pihole_on_check != self.pihole_on:
                     self.availability(pihole_on_check)
                     self.pihole_on = pihole_on_check
@@ -635,21 +649,28 @@ class gravity_records(dict):
             check_mqtt()))
 
     def exit_intended(self, *args):
-        """Callback function for trapping exit signals"""
-        if int(args[0]) > 0:
-            logger.info(f'Signal {signal.strsignal(args[0]).upper()} '
-                        'received... exiting...')
+        """Callback function for trapping exit signals and/or
+        exiting gravity_records."""
+        try:
+            if int(args[0]) > 0:
+                logger.info('Signal '
+                            f'{signal.strsignal(args[0]).upper()} '
+                            'received... exiting...')
+        except IndexError:
+            logger.info('An issue has been detected.  Closing mqtt objects.')
         self.availability(False)
         self.exiting = True
-        self.connection.persistent = False
         self.connection.cancel_message_future()
 
     @log_decorator
     def FTL_pid(self) -> int:
         """Get the pid of Pi-hole"""
         rc = 0
-        with open(config['ftl_pid_file'], 'r') as file:
-            rc = int(file.read().rstrip())
+        try:
+            with open(config['ftl_pid_file'], 'r') as file:
+                rc = int(file.read().rstrip())
+        except FileNotFoundError:
+            rc = 0
         return rc
 
     def availability(self, av_on: bool = True):
@@ -691,46 +712,67 @@ def run() -> int:
     # Set rc for the event that connecting to the gravity.db file fails
     # this could be that the location is incorrectly specified or a
     # problem with permissions
-    rc = 4
+    rc = 0b0000011
 
-    # Create sqlite connection.
-    # Connect to database - this connection is used for the regular
-    # checking for changes (made in the Pi-hole webgui)
-    with sqlite3.connect(config['db_file']) as db_con:
-        # Set rc for the event that there is a problem setting up the
-        # asyncio event loop.
-        rc = 3
+    # We need to distinguish intended from unintended sqlite/MQTT disconnects.
+    # If a disconnect is not intended a connection will be re-established.
+    reconnect = True
+    while reconnect:
+        # Create sqlite connection.
+        # Connect to database - this connection is used for the regular
+        # checking for changes (made in the Pi-hole webgui)
+        with sqlite3.connect(config['db_file']) as db_con:
+            # Set rc for the event that there is a problem setting up the
+            # asyncio event loop.
+            rc = 0b0000010
 
-        # Set event loop policy
-        asyncio.set_event_loop_policy(EL_policy())
-        # Create and enter asyncio loop
-        with asyncio.Runner() as runner:
-            loop = runner.get_loop()
+            # Set event loop policy
+            asyncio.set_event_loop_policy(EL_policy())
 
-            # Set rc for the event that there is a problem setting up
-            # the MQTT connection.
-            rc = 2
+            # Create and enter asyncio loop
+            with asyncio.Runner() as runner:
+                loop = runner.get_loop()
 
-            # Create and start mqtt connection
-            with mqtt.mqtt_connection(
-                    loop=loop,
-                    user=config['mqtt_user'],
-                    pw=config['mqtt_pw'],
-                    host=config['mqtt_host'],
-                    port=int(config['mqtt_port']),
-                    use_ssl=bool(config['mqtt_ssl']),
-                    keepalive=int(config['mqtt_keepalive']),
-                    sock_buff=int(config['mqtt_sock_buff']),
-                    sleep_time=float(config['mqtt_check_frequency']),
-                    subscribe_topic=f'{config["mqtt_topic"]}/+/set'
+                # Set rc for the event that there is a problem setting up
+                # the MQTT connection.
+                rc = 0b0000001
+
+                # Create and start mqtt connection
+                try:
+                    with mqtt.mqtt_connection(
+                            loop=loop,
+                            user=config['mqtt_user'],
+                            pw=config['mqtt_pw'],
+                            host=config['mqtt_host'],
+                            port=int(config['mqtt_port']),
+                            use_ssl=bool(config['mqtt_ssl']),
+                            keepalive=int(config['mqtt_keepalive']),
+                            sock_buff=int(config['mqtt_sock_buff']),
+                            sleep_time=float(config['mqtt_check_frequency']),
+                            subscribe_topics=[
+                                f'{config["mqtt_topic"]}/+/set',
+                                f'{config["mqtt_hass_topic"]}/status'
+                            ]
                     ) as m_con:
-                if m_con:
-                    grav_recs = gravity_records(
-                        mqtt_connection=m_con,
-                        db_connection=db_con
-                    )
-                    rc = runner.run(grav_recs.main())
-                logger.info('Exiting...')
+                        if m_con:
+                            grav_recs = gravity_records(
+                                mqtt_connection=m_con,
+                                db_connection=db_con
+                            )
+                            rc = runner.run(grav_recs.main())
+                except mqtt.mqttConnectionError:
+                    logger.error('Connection with mqtt broker failed.')
+                    time.sleep(config['mqtt_check_frequency'])
+                except sqlite3.OperationalError:
+                    logger.error('Connection with pi-hole db failed.')
+                    time.sleep(config['pihole_check_frequency'])
+
+        if rc & 0b0110101:  # This covers rc values that warrant reconnecting.
+            logger.info('Unintended disconnect, reconnecting...')
+        else:
+            logger.info('Exiting...')
+            reconnect = False
+
     return rc
 
 
