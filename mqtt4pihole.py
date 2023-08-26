@@ -1,7 +1,7 @@
 """mqtt4pihole creates an interface between Pi-hole and MQTT,
 allowing certain elements to be exposed to Home Assistant as switches
 """
-__version__ = '0.3.0'
+__version__ = '0.3.1'
 
 import json
 import os
@@ -669,7 +669,10 @@ class gravity_records(dict):
         try:
             with open(config['ftl_pid_file'], 'r') as file:
                 rc = int(file.read().rstrip())
-        except FileNotFoundError:
+        except (
+            FileNotFoundError,
+            ValueError
+        ):
             rc = 0
         return rc
 
@@ -689,7 +692,7 @@ def run() -> int:
     if not config.load_config():
         logger.critical('One or more of mqtt_user, mqtt_pw, '
                         'or mqtt_host is missing - cannot continue')
-        sys.exit('Error loading config')
+        return 0b10000000
 
     # Set up logging. Using a dictionary with get() handles invalid config.
     log_lookup = {
@@ -762,10 +765,10 @@ def run() -> int:
                             rc = runner.run(grav_recs.main())
                 except mqtt.mqttConnectionError:
                     logger.error('Connection with mqtt broker failed.')
-                    time.sleep(config['mqtt_check_frequency'])
+                    time.sleep(float(config['mqtt_check_frequency']))
                 except sqlite3.OperationalError:
                     logger.error('Connection with pi-hole db failed.')
-                    time.sleep(config['pihole_check_frequency'])
+                    time.sleep(float(config['pihole_check_frequency']))
 
         if rc & 0b0110101:  # This covers rc values that warrant reconnecting.
             logger.info('Unintended disconnect, reconnecting...')
