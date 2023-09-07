@@ -219,7 +219,12 @@ class mqtt_connection:
                 socket.herror,
                 socket.gaierror
         ) as conErr:
-            logging.error(conErr)
+            logging.error('Connection error while trying to connect to MQTT '
+                          f'broker: [{str(conErr.errno)}] {conErr.strerror}')
+            self.connect_result.set_result(-1)
+        except OSError as osErr:
+            logging.error('Error while connecting to MQTT broker')
+            logging.error(osErr)
             self.connect_result.set_result(-1)
 
     def create_message_future(self):

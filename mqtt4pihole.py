@@ -1,7 +1,7 @@
 """mqtt4pihole creates an interface between Pi-hole and MQTT,
 allowing certain elements to be exposed to Home Assistant as switches
 """
-__version__ = '0.3.1'
+__version__ = '0.3.2'
 
 import json
 import os
