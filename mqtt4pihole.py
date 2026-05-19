@@ -6,6 +6,7 @@ __version__ = '0.3.3'
 import json
 import os
 import signal
+import socket
 import sys
 import sqlite3
 import asyncio
@@ -386,6 +387,74 @@ class gravity_records(dict):
                 )
             logger.debug(f'Updated {self.switch_type} record {self.id}')
 
+    class dns_record(__gravity_record):
+        """A group of dns records represented as an object"""
+        def __init__(self, record: list, publish_func) -> None:
+            """A group of dns records represented as an object.
+
+            Creation of a record sets up its initial state.
+            This should include:
+            type: 'dns', id, dns_type, enabled, ip_address,
+            domain_name, c_names
+            """
+            self.switch_type = 'dns'
+            super().__init__(record, publish_func)
+            self.st_topic = (f'{config["mqtt_topic"]}/'
+                             f'{self.switch_type}_{self.id}')
+            self.hass_name = f'{self.switch_type} {self.id}:{self.domain_name}'
+            self.__json_state_msg = json.loads(
+                '{'
+                '"state": "X", '
+                '"ip_address": "X", '
+                '"domain_name": "X", '
+                '"c_names": "X"'
+                '}'
+            )
+
+        @log_decorator
+        def st_update(self) -> dict:
+            """Return a dictionary for the state of the record,
+            for sending to MQTT
+            """
+            return {
+                'state': 'ON' if self.enabled == 1 else 'OFF',
+                'ip_address': self.ip_address,
+                'domain_name': self.domain_name,
+                'c_names': self.c_names
+            }
+
+        # Update the record based on the current state of the object
+        # This is different for dns_record objects because they are driven
+        # by dnsrecords.yaml and homeassistant rather than gravity.db.
+        def record_update(self, record: list):
+            """Update the dns record object, based on a list contiaining:
+            id, type, domain, enabled, date added, date modified, and comment
+            """
+            old_enabled = self.enabled
+            (
+                self.id,
+                self.dns_type,
+                self.enabled,
+                self.ip_address,
+                self.domain_name,
+                self.c_names
+            ) = record[1:6]
+            self.for_hass_update = (
+                self.for_hass_update or (old_enabled is not self.enabled)
+                )
+            logger.debug(f'Updated {self.switch_type} record {self.id}')
+
+        @log_decorator
+        def sql_update(self) -> tuple:
+            """Return the SQL command needed to update and then check
+            the record in gravity.db.
+
+            A tuple is returned, containing the SQL command to update
+            the record, and the SQL command to check it"""
+            update_cmd = ""  # Not implemented yet
+            check_cmd = ""   # Not implemented yet
+            return (update_cmd, check_cmd)
+
     def __init__(self, mqtt_connection, db_connection) -> None:
         """The collection of gravity.db records of a particular type
         (e.g. domain), along with associated methods that allow
@@ -402,6 +471,7 @@ class gravity_records(dict):
         self.exiting = False
         self.pihole_on = False
         self.reinitialise = False
+        self.dnsrecs = {}
         signal.signal(signal.SIGINT, self.exit_intended)
         signal.signal(signal.SIGTERM, self.exit_intended)
 
@@ -581,29 +651,37 @@ class gravity_records(dict):
             while not self.exiting:
                 await asyncio.sleep(
                     float(config['pihole_update_frequency']))
-                updates = False
+                updates = 0
                 for gr in [x for x in self.values() if x.for_pihole_update()]:
-                    updates = True
                     logger.debug(
                         f'Setting state to {gr.mqtt_state} '
                         f'for {gr.switch_type} switch {gr.id}')
-                    self.db_cur.execute(
-                        f'UPDATE "{gr.switch_type}" '
-                        f'SET enabled = {gr.mqtt_state} '
-                        f'WHERE id = {gr.id};')
+                    # Update the gravity.db record
+                    if gr.switch_type == 'dns':
+                        updates = 2
+                        update_sql, check_sql = gr.update_sql()
+                    else:
+                        updates = max(updates, 1)
+                        update_sql = (
+                            f'UPDATE "{gr.switch_type}" '
+                            f'SET enabled = {gr.mqtt_state} '
+                            f'WHERE id = {gr.id};'
+                        )
+                        check_sql = (
+                            'SELECT enabled '
+                            f'FROM "{gr.switch_type}" '
+                            f'WHERE id = {gr.id};'
+                        )
+                    self.db_cur.execute(update_sql)
                     self.db_con.commit()
                     # Verify what's been sent to the db and publish
                     # this back to MQTT
-                    sqlcheck = self.db_cur.execute(
-                        'SELECT enabled '
-                        f'FROM "{gr.switch_type}" '
-                        f'WHERE id = {gr.id};'
-                        ).fetchall()[0][0]
-                    gr.enabled = sqlcheck
+                    ch_result = self.db_cur.execute(check_sql).fetchall()[0][0]
+                    gr.enabled = ch_result
                     logger.debug('Check of db confirmed that '
-                                 f'state was set to {str(sqlcheck)}')
+                                 f'state was set to {str(ch_result)}')
                 # If the gravity db is changed, we need to reload lists
-                # in dnsmasq-FTL with SIGRTMIN
+                # in dnsmasq-FTL with SIGRTMIN/SIGHUP
                 ftl_pid = self.FTL_pid()
                 if updates and ftl_pid != 0:
                     # Republish to Hass all records if any updates
@@ -611,7 +689,14 @@ class gravity_records(dict):
                     for gr in self.values():
                         gr.hass_upd()
                     try:
-                        os.kill(ftl_pid, signal.SIGRTMIN)
+                        ftl_signal = {
+                            1: signal.SIGRTMIN,
+                            2: signal.SIGHUP
+                        }
+                        os.kill(
+                            ftl_pid,
+                            ftl_signal[updates]
+                        )
                     except Exception:
                         logger.error('Failed to reload Pi-hole lists',
                                      exc_info=1)
@@ -653,12 +738,111 @@ class gravity_records(dict):
             logger.error('Error in check_pihole loop')
             return 0b1000000
 
+        async def check_dns_records() -> int:
+            """Load dns records (if they exist) and then turn
+            on and off records in pi-hole as appropriate when
+            switch changes are detected.
+
+            The dnsrecords only need to be loaded once, at startup.
+            This is different to the gravity records which need to be
+            checked continuously because they are configured via pihole.
+            This is why we have the dnsrecords initated here, whilst other
+            records are initiated in the check_gravity function.
+            """
+
+            async def get_ip(domaintolookup: str) -> str:
+                """Use local name resolution to find an ip address."""
+                try:
+                    return await asyncio.to_thread(
+                        socket.gethostbyname(domaintolookup)
+                    )
+                except socket.gaierror:
+                    logger.warning('Failed to lookup IP for '
+                                   f'{domaintolookup}, returning '
+                                   '0.0.0.0')
+                    return '0.0.0.0'
+
+            try:
+                with open('dnsrecords.yaml', 'r') as dnsrecfile:
+                    self.dnsrecs = yaml.safe_load(dnsrecfile)
+                    logger.debug('dnsrecords.yaml file loaded')
+            except FileNotFoundError:
+                logger.info('No dnsrecords.yaml file')
+            except ValueError:
+                logger.warning('Error in dnsrecords.yaml, skipping...')
+
+            # Initialise the dns records based on what is in self.dnsrecs
+            rec_id = 0
+            for rec_collection in [
+                x for x in self.dnsrecs.keys() if
+                (
+                    x in ['dnsrecords', 'cnamerecords'] and
+                    isinstance(self.dnsrecs[x], dict)
+                )
+            ]:
+                for record_to_add in rec_collection.keys():
+                    cur_dnsrec = self.dnsrecs[rec_collection][record_to_add]
+                    if rec_collection == 'dnsrecords':
+                        if isinstance(cur_dnsrec, str):
+                            cur_dnsrec = {'ip': cur_dnsrec}
+                        if cur_dnsrec.setdefault('ip', 'lookup') == 'lookup':
+                            cur_dnsrec.update(
+                                {'ip': await get_ip(record_to_add)}
+                            )
+                        if isinstance(
+                            cur_dnsrec.setdefault('cnamerecords', []), str
+                        ):
+                            cur_dnsrec.update(
+                                {'cnamerecords': [cur_dnsrec['cnamerecords']]}
+                            )
+                    else:
+                        if isinstance(cur_dnsrec, str):
+                            cur_dnsrec = {'cnamerecords': cur_dnsrec}
+                        cur_dnsrec.update({'ip': None})
+                    key, val = (
+                        f'dnsrecord_{record_to_add}',
+                        self.dns_record(
+                            [
+                                'dns',
+                                rec_id,
+                                'A',
+                                not (
+                                    cur_dnsrec
+                                    .setdefault('startstate', 'off') == 'off'
+                                ),
+                                cur_dnsrec['ip'],
+                                record_to_add,
+                                cur_dnsrec['cnamerecords']
+                            ],
+                            self.connection.client.publish
+                        )
+                    )
+                    rec_id += 1
+                    self.update({key: val})
+                    await self[key].hass_add()
+
+            while not self.exiting:
+                await asyncio.sleep(
+                    float(config['pihole_update_frequency']))
+                # Add code here to find, add, and delete cname and
+                # 'A' records in gravity.db as appropriate, depending
+                # on the state of each record.
+                #
+                # After the state is changed, pi-hole needs to be reloaded.
+                pass
+            else:
+                logger.debug('Finished check_dns_records loop')
+                return 0
+            logger.error('Error in check_dns_records loop')
+            return 0b110000
+
         # Run tasks in continuous loop
         return sum(await asyncio.gather(
             check_gravity(),
             update_pihole(),
             check_pihole(),
-            check_mqtt()))
+            check_mqtt(),
+            check_dns_records()))
 
     def exit_intended(self, *args):
         """Callback function for trapping exit signals and/or

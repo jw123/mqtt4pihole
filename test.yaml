@@ -1,0 +1,19 @@
+dnsrecords:
+  an.example.domain:
+    ip: 127.0.0.1
+    cnamerecords:
+      - alt1.domain.com
+      - alt2.domain.com
+      - alt3.domain.com
+      - alt4.domain.com
+    startstate: off            # Optional - default = on
+  a.simple.domain: 127.0.0.1   # This one has no cnames
+  a.lookup.domain:
+    ip: lookup                 # Lookup will resolve IP
+    cnamerecords:
+      - domain.to.lookup.com
+cnamerecords:
+  source.domain.com: localhost
+  different.domain.com:
+    cname: localhost
+    startstate: off
