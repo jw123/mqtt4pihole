@@ -604,13 +604,14 @@ class gravity_records(dict):
                                  f'state was set to {str(sqlcheck)}')
                 # If the gravity db is changed, we need to reload lists
                 # in dnsmasq-FTL with SIGRTMIN
-                if updates and self.FTL_pid() != 0:
+                ftl_pid = self.FTL_pid()
+                if updates and ftl_pid != 0:
                     # Republish to Hass all records if any updates
                     # This helps Hass keep state properly
                     for gr in self.values():
                         gr.hass_upd()
                     try:
-                        os.kill(self.FTL_pid(), signal.SIGRTMIN)
+                        os.kill(ftl_pid, signal.SIGRTMIN)
                     except Exception:
                         logger.error('Failed to reload Pi-hole lists',
                                      exc_info=1)
@@ -625,14 +626,25 @@ class gravity_records(dict):
             otherwise log a message
             """
             logger.debug('Starting check_pihole loop')
+            # Require this many consecutive "not running" results before
+            # declaring offline, to avoid brief FTL restarts (triggered by
+            # SIGRTMIN during list reloads) causing spurious unavailability.
+            offline_threshold = 2
+            pihole_off_count = offline_threshold
             while not self.exiting:
                 pihole_on_check = bool(self.FTL_pid())
                 if not pihole_on_check:
                     logger.warning('Pi-hole is not running.  '
                                    'No action will be taken')
-                if pihole_on_check != self.pihole_on:
-                    self.availability(pihole_on_check)
-                    self.pihole_on = pihole_on_check
+                    pihole_off_count = min(
+                        pihole_off_count + 1, offline_threshold)
+                else:
+                    pihole_off_count = 0
+                effective_on = (
+                    pihole_on_check or pihole_off_count < offline_threshold)
+                if effective_on != self.pihole_on:
+                    self.availability(effective_on)
+                    self.pihole_on = effective_on
                 await asyncio.sleep(
                     float(config['pihole_check_frequency']))
             else:
