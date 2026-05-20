@@ -1,7 +1,7 @@
 """mqtt4pihole creates an interface between Pi-hole and MQTT,
 allowing certain elements to be exposed to Home Assistant as switches
 """
-__version__ = '0.3.3'
+__version__ = '0.4.0'
 
 import json
 import os
@@ -10,6 +10,7 @@ import socket
 import sys
 import sqlite3
 import asyncio
+import tomllib
 import logging
 import selectors
 import yaml
@@ -17,6 +18,19 @@ import mqtt_async as mqtt
 import time
 
 logger = logging.getLogger(__name__)
+
+
+def _startstate_off(value) -> bool:
+    """Return True when a dnsrecords.yaml startstate value means 'off'.
+
+    Handles PyYAML's YAML 1.1 booleans (`on`/`off` -> True/False) as
+    well as string spellings.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return not value
+    return str(value).strip().lower() in ('off', 'false', 'no', '0')
 
 
 def log_decorator(func, level=logging.DEBUG):
@@ -57,6 +71,7 @@ class m4p_config(dict):
         self.setdefault('pihole_check_frequency', 5)
         self.setdefault('mqtt_check_frequency', 1)
         self.setdefault('ftl_pid_file', '/run/pihole-FTL.pid')
+        self.setdefault('pihole_toml', '/etc/pihole/pihole.toml')
         self.setdefault('pihole_url', 'http://pi.hole/admin')
         self.setdefault('hass_tag', 'HASS')
         self.setdefault('log_level', 'INFO')
@@ -388,72 +403,70 @@ class gravity_records(dict):
             logger.debug(f'Updated {self.switch_type} record {self.id}')
 
     class dns_record(__gravity_record):
-        """A group of dns records represented as an object"""
-        def __init__(self, record: list, publish_func) -> None:
-            """A group of dns records represented as an object.
+        """A local DNS record (an A record with optional associated
+        CNAMEs, or a standalone CNAME) represented as a single switch.
 
-            Creation of a record sets up its initial state.
-            This should include:
-            type: 'dns', id, dns_type, enabled, ip_address,
-            domain_name, c_names
-            """
+        Local DNS records live in pihole.toml (dns.hosts and
+        dns.cnameRecords), not in gravity.db, so updates happen via
+        check_dns_records rather than update_pihole.
+        """
+        def __init__(self, record: list, publish_func) -> None:
             self.switch_type = 'dns'
             super().__init__(record, publish_func)
             self.st_topic = (f'{config["mqtt_topic"]}/'
                              f'{self.switch_type}_{self.id}')
-            self.hass_name = f'{self.switch_type} {self.id}:{self.domain_name}'
-            self.__json_state_msg = json.loads(
-                '{'
-                '"state": "X", '
-                '"ip_address": "X", '
-                '"domain_name": "X", '
-                '"c_names": "X"'
-                '}'
-            )
+            self.hass_name = (f'{self.switch_type} {self.id}: '
+                              f'{self.domain_name}')
 
         @log_decorator
         def st_update(self) -> dict:
-            """Return a dictionary for the state of the record,
-            for sending to MQTT
-            """
-            return {
+            """Return the state dict for sending to MQTT."""
+            base = {
                 'state': 'ON' if self.enabled == 1 else 'OFF',
-                'ip_address': self.ip_address,
+                'type': self.dns_type,
                 'domain_name': self.domain_name,
-                'c_names': self.c_names
             }
+            if self.dns_type == 'A':
+                base['ip_address'] = self.ip_address
+                base['c_names'] = self.c_names
+            else:
+                base['target'] = self.target
+            return base
 
-        # Update the record based on the current state of the object
-        # This is different for dns_record objects because they are driven
-        # by dnsrecords.yaml and homeassistant rather than gravity.db.
         def record_update(self, record: list):
-            """Update the dns record object, based on a list contiaining:
-            id, type, domain, enabled, date added, date modified, and comment
+            """Update from a list:
+            ['dns', id, dns_type, enabled, domain_name,
+             ip_address, c_names, target]
             """
             old_enabled = self.enabled
             (
                 self.id,
                 self.dns_type,
                 self.enabled,
-                self.ip_address,
                 self.domain_name,
-                self.c_names
-            ) = record[1:6]
+                self.ip_address,
+                self.c_names,
+                self.target,
+            ) = record[1:8]
             self.for_hass_update = (
                 self.for_hass_update or (old_enabled is not self.enabled)
-                )
+            )
             logger.debug(f'Updated {self.switch_type} record {self.id}')
 
-        @log_decorator
-        def sql_update(self) -> tuple:
-            """Return the SQL command needed to update and then check
-            the record in gravity.db.
-
-            A tuple is returned, containing the SQL command to update
-            the record, and the SQL command to check it"""
-            update_cmd = ""  # Not implemented yet
-            check_cmd = ""   # Not implemented yet
-            return (update_cmd, check_cmd)
+        def toml_entries(self) -> tuple:
+            """Return (hosts_lines, cname_lines) this record contributes
+            to pihole.toml when enabled.
+            """
+            if self.dns_type == 'A':
+                hosts = [f'{self.ip_address} {self.domain_name}']
+                cnames = [
+                    f'{c},{self.domain_name}'
+                    for c in (self.c_names or [])
+                ]
+            else:
+                hosts = []
+                cnames = [f'{self.domain_name},{self.target}']
+            return (hosts, cnames)
 
     def __init__(self, mqtt_connection, db_connection) -> None:
         """The collection of gravity.db records of a particular type
@@ -645,58 +658,43 @@ class gravity_records(dict):
 
         async def update_pihole() -> int:
             """Update gravity.db (in response to MQTT messages)
-            and attempt to reload lists in Pi-hole
+            and attempt to reload lists in Pi-hole.
+
+            DNS records live in pihole.toml, not gravity.db, and are
+            handled by check_dns_records, so they are skipped here.
             """
             logger.debug('Starting update_pihole loop')
             while not self.exiting:
                 await asyncio.sleep(
                     float(config['pihole_update_frequency']))
-                updates = 0
-                for gr in [x for x in self.values() if x.for_pihole_update()]:
+                updates = False
+                for gr in [
+                    x for x in self.values()
+                    if x.for_pihole_update() and x.switch_type != 'dns'
+                ]:
+                    updates = True
                     logger.debug(
                         f'Setting state to {gr.mqtt_state} '
                         f'for {gr.switch_type} switch {gr.id}')
-                    # Update the gravity.db record
-                    if gr.switch_type == 'dns':
-                        updates = 2
-                        update_sql, check_sql = gr.update_sql()
-                    else:
-                        updates = max(updates, 1)
-                        update_sql = (
-                            f'UPDATE "{gr.switch_type}" '
-                            f'SET enabled = {gr.mqtt_state} '
-                            f'WHERE id = {gr.id};'
-                        )
-                        check_sql = (
-                            'SELECT enabled '
-                            f'FROM "{gr.switch_type}" '
-                            f'WHERE id = {gr.id};'
-                        )
-                    self.db_cur.execute(update_sql)
+                    self.db_cur.execute(
+                        f'UPDATE "{gr.switch_type}" '
+                        f'SET enabled = {gr.mqtt_state} '
+                        f'WHERE id = {gr.id};')
                     self.db_con.commit()
-                    # Verify what's been sent to the db and publish
-                    # this back to MQTT
-                    ch_result = self.db_cur.execute(check_sql).fetchall()[0][0]
-                    gr.enabled = ch_result
+                    sqlcheck = self.db_cur.execute(
+                        'SELECT enabled '
+                        f'FROM "{gr.switch_type}" '
+                        f'WHERE id = {gr.id};'
+                    ).fetchall()[0][0]
+                    gr.enabled = sqlcheck
                     logger.debug('Check of db confirmed that '
-                                 f'state was set to {str(ch_result)}')
-                # If the gravity db is changed, we need to reload lists
-                # in dnsmasq-FTL with SIGRTMIN/SIGHUP
+                                 f'state was set to {str(sqlcheck)}')
                 ftl_pid = self.FTL_pid()
                 if updates and ftl_pid != 0:
-                    # Republish to Hass all records if any updates
-                    # This helps Hass keep state properly
                     for gr in self.values():
                         gr.hass_upd()
                     try:
-                        ftl_signal = {
-                            1: signal.SIGRTMIN,
-                            2: signal.SIGHUP
-                        }
-                        os.kill(
-                            ftl_pid,
-                            ftl_signal[updates]
-                        )
+                        os.kill(ftl_pid, signal.SIGRTMIN)
                     except Exception:
                         logger.error('Failed to reload Pi-hole lists',
                                      exc_info=1)
@@ -739,102 +737,112 @@ class gravity_records(dict):
             return 0b1000000
 
         async def check_dns_records() -> int:
-            """Load dns records (if they exist) and then turn
-            on and off records in pi-hole as appropriate when
-            switch changes are detected.
+            """Load dns records from dnsrecords.yaml, expose them as
+            Home Assistant switches, and reconcile pihole.toml's
+            dns.hosts and dns.cnameRecords arrays when switches toggle.
 
-            The dnsrecords only need to be loaded once, at startup.
-            This is different to the gravity records which need to be
-            checked continuously because they are configured via pihole.
-            This is why we have the dnsrecords initated here, whilst other
-            records are initiated in the check_gravity function.
+            Records are loaded once at startup (they are configured by
+            the user via dnsrecords.yaml, not by Pi-hole itself).
             """
 
-            async def get_ip(domaintolookup: str) -> str:
-                """Use local name resolution to find an ip address."""
+            async def get_ip(domain: str) -> str:
                 try:
                     return await asyncio.to_thread(
-                        socket.gethostbyname(domaintolookup)
+                        socket.gethostbyname, domain
                     )
                 except socket.gaierror:
-                    logger.warning('Failed to lookup IP for '
-                                   f'{domaintolookup}, returning '
-                                   '0.0.0.0')
+                    logger.warning(f'Failed to lookup IP for {domain}, '
+                                   'returning 0.0.0.0')
                     return '0.0.0.0'
 
+            self.dnsrecs = {}
             try:
-                with open('dnsrecords.yaml', 'r') as dnsrecfile:
-                    self.dnsrecs = yaml.safe_load(dnsrecfile)
-                    logger.debug('dnsrecords.yaml file loaded')
+                with open('dnsrecords.yaml', 'r') as f:
+                    self.dnsrecs = yaml.safe_load(f) or {}
+                logger.debug('dnsrecords.yaml file loaded')
             except FileNotFoundError:
                 logger.info('No dnsrecords.yaml file')
-            except ValueError:
-                logger.warning('Error in dnsrecords.yaml, skipping...')
+            except yaml.YAMLError:
+                logger.warning('Error parsing dnsrecords.yaml, '
+                               'skipping...', exc_info=1)
+                self.dnsrecs = {}
 
-            # Initialise the dns records based on what is in self.dnsrecs
             rec_id = 0
-            for rec_collection in [
-                x for x in self.dnsrecs.keys() if
-                (
-                    x in ['dnsrecords', 'cnamerecords'] and
-                    isinstance(self.dnsrecs[x], dict)
-                )
-            ]:
-                for record_to_add in rec_collection.keys():
-                    cur_dnsrec = self.dnsrecs[rec_collection][record_to_add]
-                    if rec_collection == 'dnsrecords':
-                        if isinstance(cur_dnsrec, str):
-                            cur_dnsrec = {'ip': cur_dnsrec}
-                        if cur_dnsrec.setdefault('ip', 'lookup') == 'lookup':
-                            cur_dnsrec.update(
-                                {'ip': await get_ip(record_to_add)}
-                            )
-                        if isinstance(
-                            cur_dnsrec.setdefault('cnamerecords', []), str
-                        ):
-                            cur_dnsrec.update(
-                                {'cnamerecords': [cur_dnsrec['cnamerecords']]}
-                            )
-                    else:
-                        if isinstance(cur_dnsrec, str):
-                            cur_dnsrec = {'cnamerecords': cur_dnsrec}
-                        cur_dnsrec.update({'ip': None})
-                    key, val = (
-                        f'dnsrecord_{record_to_add}',
-                        self.dns_record(
-                            [
-                                'dns',
-                                rec_id,
-                                'A',
-                                not (
-                                    cur_dnsrec
-                                    .setdefault('startstate', 'off') == 'off'
-                                ),
-                                cur_dnsrec['ip'],
-                                record_to_add,
-                                cur_dnsrec['cnamerecords']
-                            ],
-                            self.connection.client.publish
-                        )
+            a_section = self.dnsrecs.get('dnsrecords') or {}
+            if isinstance(a_section, dict):
+                for domain, spec in a_section.items():
+                    if isinstance(spec, str):
+                        spec = {'ip': spec}
+                    elif not isinstance(spec, dict):
+                        logger.warning(
+                            f'Skipping invalid dnsrecord {domain}')
+                        continue
+                    ip = spec.get('ip', 'lookup')
+                    if ip == 'lookup' or ip is None:
+                        ip = await get_ip(domain)
+                    cnames = spec.get('cnamerecords') or []
+                    if isinstance(cnames, str):
+                        cnames = [cnames]
+                    enabled = 0 if _startstate_off(
+                        spec.get('startstate')) else 1
+                    key = f'dns_{rec_id}'
+                    self[key] = self.dns_record(
+                        ['dns', rec_id, 'A', enabled,
+                         domain, ip, list(cnames), None],
+                        self.connection.client.publish
                     )
-                    rec_id += 1
-                    self.update({key: val})
                     await self[key].hass_add()
+                    rec_id += 1
 
+            c_section = self.dnsrecs.get('cnamerecords') or {}
+            if isinstance(c_section, dict):
+                for source, spec in c_section.items():
+                    if isinstance(spec, str):
+                        spec = {'target': spec}
+                    elif not isinstance(spec, dict):
+                        logger.warning(
+                            f'Skipping invalid cnamerecord {source}')
+                        continue
+                    target = spec.get('target') or spec.get('cname')
+                    if not target:
+                        logger.warning(
+                            f'cnamerecord {source} missing target, '
+                            'skipping')
+                        continue
+                    enabled = 0 if _startstate_off(
+                        spec.get('startstate')) else 1
+                    key = f'dns_{rec_id}'
+                    self[key] = self.dns_record(
+                        ['dns', rec_id, 'CNAME', enabled,
+                         source, None, [], target],
+                        self.connection.client.publish
+                    )
+                    await self[key].hass_add()
+                    rec_id += 1
+
+            # Reconcile pihole.toml to current desired state once on
+            # startup so startstate is honored, then on every change.
+            first_pass = True
             while not self.exiting:
+                dns_recs = [
+                    gr for gr in self.values()
+                    if gr.switch_type == 'dns'
+                ]
+                pending = [
+                    gr for gr in dns_recs if gr.for_pihole_update()
+                ]
+                if dns_recs and (pending or first_pass) and self.pihole_on:
+                    if await self._reconcile_pihole_dns(dns_recs, pending):
+                        first_pass = False
+                    for gr in pending:
+                        gr.hass_upd()
                 await asyncio.sleep(
                     float(config['pihole_update_frequency']))
-                # Add code here to find, add, and delete cname and
-                # 'A' records in gravity.db as appropriate, depending
-                # on the state of each record.
-                #
-                # After the state is changed, pi-hole needs to be reloaded.
-                pass
             else:
                 logger.debug('Finished check_dns_records loop')
                 return 0
             logger.error('Error in check_dns_records loop')
-            return 0b110000
+            return 0b100000000
 
         # Run tasks in continuous loop
         return sum(await asyncio.gather(
@@ -878,6 +886,132 @@ class gravity_records(dict):
             topic=f'{config["mqtt_topic"]}/state',
             payload='online' if av_on else 'offline',
             retain=True)
+
+    @staticmethod
+    def _host_entry_name(entry: str) -> str:
+        """Extract the hostname from a 'IP hostname' dns.hosts entry."""
+        parts = str(entry).strip().split()
+        return parts[1] if len(parts) >= 2 else ''
+
+    @staticmethod
+    def _cname_entry_source(entry: str) -> str:
+        """Extract the source from a 'source,target[,ttl]' entry."""
+        return str(entry).split(',', 1)[0].strip()
+
+    @staticmethod
+    def _toml_str_array(values: list) -> str:
+        """Format a list of strings as a TOML inline array."""
+        def esc(v):
+            return str(v).replace('\\', '\\\\').replace('"', '\\"')
+        return '[ ' + ', '.join(f'"{esc(v)}"' for v in values) + ' ]'
+
+    def _read_pihole_dns_arrays(self) -> tuple:
+        """Read the current dns.hosts and dns.cnameRecords arrays from
+        pihole.toml. Returns ([], []) on failure.
+        """
+        try:
+            with open(config['pihole_toml'], 'rb') as f:
+                data = tomllib.load(f)
+        except (FileNotFoundError, tomllib.TOMLDecodeError) as e:
+            logger.error(
+                f'Failed to read {config["pihole_toml"]}: {e}')
+            return ([], [])
+        dns_sec = data.get('dns', {}) or {}
+        return (
+            list(dns_sec.get('hosts', []) or []),
+            list(dns_sec.get('cnameRecords', []) or []),
+        )
+
+    async def _pihole_set_config(self, key: str, values: list) -> bool:
+        """Write a TOML array config value via `pihole-FTL --config`."""
+        payload = self._toml_str_array(values)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'pihole-FTL', '--config', key, payload,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+        except FileNotFoundError:
+            logger.error('pihole-FTL not found; cannot apply DNS changes')
+            return False
+        if proc.returncode != 0:
+            logger.error(
+                f'pihole-FTL --config {key} failed '
+                f'(rc={proc.returncode}): {stderr.decode().strip()}')
+            return False
+        logger.debug(f'pihole-FTL --config {key} set: {payload}')
+        return True
+
+    async def _pihole_reload_dns(self) -> bool:
+        """Ask Pi-hole to reload its DNS configuration."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'pihole', 'reloaddns',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+        except FileNotFoundError:
+            logger.error('pihole command not found; DNS changes may '
+                         'not take effect until next FTL restart')
+            return False
+        if proc.returncode != 0:
+            logger.warning(
+                f'pihole reloaddns exited with code {proc.returncode}')
+            return False
+        return True
+
+    async def _reconcile_pihole_dns(
+            self, dns_recs: list, pending: list) -> bool:
+        """Rebuild pihole.toml's dns.hosts and dns.cnameRecords arrays
+        so they reflect our records' current intended state, leaving
+        any unmanaged entries (added by the user via the Pi-hole UI)
+        untouched. Returns True if writes (when needed) succeeded.
+        """
+        cur_hosts, cur_cnames = self._read_pihole_dns_arrays()
+        managed_a = {
+            gr.domain_name for gr in dns_recs if gr.dns_type == 'A'
+        }
+        managed_c = (
+            {gr.domain_name for gr in dns_recs if gr.dns_type == 'CNAME'}
+            | {c for gr in dns_recs if gr.dns_type == 'A'
+               for c in (gr.c_names or [])}
+        )
+        for gr in pending:
+            logger.debug(
+                f'Applying state {gr.mqtt_state} to dns record '
+                f'{gr.id} ({gr.domain_name})')
+            gr.enabled = gr.mqtt_state
+        new_hosts = [
+            h for h in cur_hosts
+            if self._host_entry_name(h) not in managed_a
+        ]
+        new_cnames = [
+            c for c in cur_cnames
+            if self._cname_entry_source(c) not in managed_c
+        ]
+        for gr in dns_recs:
+            if gr.enabled:
+                h_lines, c_lines = gr.toml_entries()
+                new_hosts.extend(h_lines)
+                new_cnames.extend(c_lines)
+        ok = True
+        wrote = False
+        if new_hosts != cur_hosts:
+            if await self._pihole_set_config('dns.hosts', new_hosts):
+                wrote = True
+            else:
+                ok = False
+        if new_cnames != cur_cnames:
+            if await self._pihole_set_config(
+                    'dns.cnameRecords', new_cnames):
+                wrote = True
+            else:
+                ok = False
+        if wrote:
+            await self._pihole_reload_dns()
+        return ok
 
 
 @log_decorator

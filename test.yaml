@@ -1,3 +1,9 @@
+# Sample dnsrecords.yaml. Copy to dnsrecords.yaml in the working
+# directory to use.
+
+# A records. Each top-level entry is ONE Home Assistant switch that
+# controls the A record together with any associated CNAMEs pointing
+# at its domain.
 dnsrecords:
   an.example.domain:
     ip: 127.0.0.1
@@ -7,13 +13,16 @@ dnsrecords:
       - alt3.domain.com
       - alt4.domain.com
     startstate: off            # Optional - default = on
-  a.simple.domain: 127.0.0.1   # This one has no cnames
+  a.simple.domain: 127.0.0.1   # Shorthand: ip only, no associated cnames
   a.lookup.domain:
-    ip: lookup                 # Lookup will resolve IP
+    ip: lookup                 # 'lookup' resolves the IP via DNS at startup
     cnamerecords:
       - domain.to.lookup.com
+
+# Standalone CNAME records. Each top-level entry is ONE switch that
+# maps a source domain to a target.
 cnamerecords:
-  source.domain.com: localhost
+  source.domain.com: localhost   # Shorthand: target only
   different.domain.com:
-    cname: localhost
+    target: localhost
     startstate: off
