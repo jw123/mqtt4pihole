@@ -14,6 +14,7 @@ import tomllib
 import logging
 import selectors
 import yaml
+import aiohttp
 import mqtt_async as mqtt
 import time
 
@@ -898,13 +899,6 @@ class gravity_records(dict):
         """Extract the source from a 'source,target[,ttl]' entry."""
         return str(entry).split(',', 1)[0].strip()
 
-    @staticmethod
-    def _toml_str_array(values: list) -> str:
-        """Format a list of strings as a TOML inline array."""
-        def esc(v):
-            return str(v).replace('\\', '\\\\').replace('"', '\\"')
-        return '[ ' + ', '.join(f'"{esc(v)}"' for v in values) + ' ]'
-
     def _read_pihole_dns_arrays(self) -> tuple:
         """Read the current dns.hosts and dns.cnameRecords arrays from
         pihole.toml. Returns ([], []) on failure.
@@ -922,45 +916,97 @@ class gravity_records(dict):
             list(dns_sec.get('cnameRecords', []) or []),
         )
 
-    async def _pihole_set_config(self, key: str, values: list) -> bool:
-        """Write a TOML array config value via `pihole-FTL --config`."""
-        payload = self._toml_str_array(values)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                'pihole-FTL', '--config', key, payload,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-        except FileNotFoundError:
-            logger.error('pihole-FTL not found; cannot apply DNS changes')
-            return False
-        if proc.returncode != 0:
+    async def _pihole_apply_dns(
+            self, hosts: list | None, cnames: list | None) -> bool:
+        """Apply dns.hosts and/or dns.cnameRecords via the Pi-hole v6
+        REST API. An argument of None skips that key. Pi-hole reloads
+        DNS internally on a successful config change. Returns True iff
+        all requested updates succeeded.
+        """
+        if hosts is None and cnames is None:
+            return True
+        password = config.get('pihole_password')
+        if not password:
             logger.error(
-                f'pihole-FTL --config {key} failed '
-                f'(rc={proc.returncode}): {stderr.decode().strip()}')
+                'pihole_password not set in config.yaml; '
+                'cannot apply DNS changes via API')
             return False
-        logger.debug(f'pihole-FTL --config {key} set: {payload}')
-        return True
+        base = config['pihole_url'].rstrip('/')
 
-    async def _pihole_reload_dns(self) -> bool:
-        """Ask Pi-hole to reload its DNS configuration."""
+        updates = []
+        if hosts is not None:
+            updates.append(('hosts', hosts))
+        if cnames is not None:
+            updates.append(('cnameRecords', cnames))
+
         try:
-            proc = await asyncio.create_subprocess_exec(
-                'pihole', 'reloaddns',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-        except FileNotFoundError:
-            logger.error('pihole command not found; DNS changes may '
-                         'not take effect until next FTL restart')
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.post(
+                            f'{base}/api/auth',
+                            json={'password': password}) as resp:
+                        body = await resp.text()
+                        if resp.status < 200 or resp.status >= 300:
+                            logger.error(
+                                f'Pi-hole auth failed '
+                                f'(status={resp.status}): {body}')
+                            return False
+                        auth_data = json.loads(body)
+                except aiohttp.ClientError as e:
+                    logger.error(f'Pi-hole auth network error: {e}')
+                    return False
+                except json.JSONDecodeError as e:
+                    logger.error(f'Pi-hole auth returned invalid JSON: {e}')
+                    return False
+
+                sid = (auth_data.get('session') or {}).get('sid')
+                if not sid:
+                    logger.error(
+                        'Pi-hole auth response missing session id: '
+                        f'{auth_data}')
+                    return False
+                headers = {'X-FTL-SID': sid}
+
+                ok = True
+                try:
+                    for key, values in updates:
+                        try:
+                            async with session.put(
+                                    f'{base}/api/config/dns/{key}',
+                                    json={'config': {
+                                        'dns': {key: values}}},
+                                    headers=headers) as resp:
+                                if resp.status < 200 or resp.status >= 300:
+                                    logger.error(
+                                        f'Pi-hole PUT dns/{key} failed '
+                                        f'(status={resp.status}): '
+                                        f'{await resp.text()}')
+                                    ok = False
+                                else:
+                                    logger.debug(
+                                        f'Pi-hole dns.{key} set: '
+                                        f'{values}')
+                        except aiohttp.ClientError as e:
+                            logger.error(
+                                f'Pi-hole PUT dns/{key} '
+                                f'network error: {e}')
+                            ok = False
+                finally:
+                    try:
+                        async with session.delete(
+                                f'{base}/api/auth',
+                                headers=headers) as resp:
+                            if resp.status < 200 or resp.status >= 300:
+                                logger.warning(
+                                    'Pi-hole session logout returned '
+                                    f'status={resp.status}')
+                    except aiohttp.ClientError as e:
+                        logger.warning(
+                            f'Pi-hole session logout error: {e}')
+                return ok
+        except aiohttp.ClientError as e:
+            logger.error(f'Pi-hole API client error: {e}')
             return False
-        if proc.returncode != 0:
-            logger.warning(
-                f'pihole reloaddns exited with code {proc.returncode}')
-            return False
-        return True
 
     async def _reconcile_pihole_dns(
             self, dns_recs: list, pending: list) -> bool:
@@ -996,22 +1042,9 @@ class gravity_records(dict):
                 h_lines, c_lines = gr.toml_entries()
                 new_hosts.extend(h_lines)
                 new_cnames.extend(c_lines)
-        ok = True
-        wrote = False
-        if new_hosts != cur_hosts:
-            if await self._pihole_set_config('dns.hosts', new_hosts):
-                wrote = True
-            else:
-                ok = False
-        if new_cnames != cur_cnames:
-            if await self._pihole_set_config(
-                    'dns.cnameRecords', new_cnames):
-                wrote = True
-            else:
-                ok = False
-        if wrote:
-            await self._pihole_reload_dns()
-        return ok
+        hosts_arg = new_hosts if new_hosts != cur_hosts else None
+        cnames_arg = new_cnames if new_cnames != cur_cnames else None
+        return await self._pihole_apply_dns(hosts_arg, cnames_arg)
 
 
 @log_decorator

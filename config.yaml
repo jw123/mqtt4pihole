@@ -4,6 +4,7 @@
 #mqtt_user: USER
 #mqtt_pw: PASSWORD
 #mqtt_host: HOST
+#pihole_password: PIHOLE_WEB_PASSWORD
 
 ##############################################
 #### Optional inputs (with defaults shown) ###
