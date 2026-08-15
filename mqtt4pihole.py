@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import sqlite3
+import subprocess
 import asyncio
 import logging
 import selectors
@@ -16,6 +17,31 @@ import mqtt_async as mqtt
 import time
 
 logger = logging.getLogger(__name__)
+
+# pihole-FTL is built against musl, where SIGRTMIN is 35.  Python is
+# built against glibc and so reports 34 -- a signal FTL installs no
+# handler for, which therefore terminates it rather than reloading its
+# lists.  Ask FTL which signal it actually expects.
+FTL_BIN = '/usr/bin/pihole-FTL'
+
+
+def _ftl_sigrtmin() -> int:
+    """Return the real-time signal pihole-FTL uses to reload its lists."""
+    try:
+        result = subprocess.run(
+            [FTL_BIN, 'sigrtmin'],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        return int(result.stdout.strip())
+    except Exception:
+        logger.warning('Could not ask FTL for its SIGRTMIN; falling back '
+                       'to %d, which will terminate FTL rather than '
+                       'reload it if FTL is a musl build',
+                       int(signal.SIGRTMIN))
+        return int(signal.SIGRTMIN)
+
+
+FTL_SIGRTMIN = _ftl_sigrtmin()
 
 
 def log_decorator(func, level=logging.DEBUG):
@@ -611,7 +637,7 @@ class gravity_records(dict):
                     for gr in self.values():
                         gr.hass_upd()
                     try:
-                        os.kill(ftl_pid, signal.SIGRTMIN)
+                        os.kill(ftl_pid, FTL_SIGRTMIN)
                     except Exception:
                         logger.error('Failed to reload Pi-hole lists',
                                      exc_info=1)
@@ -627,8 +653,8 @@ class gravity_records(dict):
             """
             logger.debug('Starting check_pihole loop')
             # Require this many consecutive "not running" results before
-            # declaring offline, to avoid brief FTL restarts (triggered by
-            # SIGRTMIN during list reloads) causing spurious unavailability.
+            # declaring offline, so that a genuine FTL restart (an admin
+            # action, an update) does not cause spurious unavailability.
             offline_threshold = 2
             pihole_off_count = offline_threshold
             while not self.exiting:
